@@ -12,7 +12,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # === ОСНОВНЫЕ НАСТРОЙКИ ===
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8825098686:AAHsz7XDYyLOSgD8oMOWOF5uhsKUApmoXB8")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8825098686:AAH2mVz2pOo_vl6T6yMpRA_f-zWLMPMfVdc")
 MONGO_URL = os.getenv("MONGO_URL")
 
 ADMIN_CHAT_ID = 8876279113
