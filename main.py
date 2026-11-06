@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import random
 import time
@@ -7,69 +6,112 @@ import logging
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiohttp import web
+from motor.motor_asyncio import AsyncIOMotorClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # === ОСНОВНЫЕ НАСТРОЙКИ ===
-BOT_TOKEN = "8825098686:AAHsz7XDYyLOSgD8oMOWOF5uhsKUApmoXB8"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8825098686:AAHsz7XDYyLOSgD8oMOWOF5uhsKUApmoXB8")
+MONGO_URL = os.getenv("MONGO_URL")
+
 ADMIN_CHAT_ID = 8876279113
 
 CHANNEL_USERNAME = "@CS_Drop_Hub"
 CHANNEL_URL = "https://t.me/CS_Drop_Hub"
 
-DATA_FILE = "users_data.json"
-
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-users = {}
-used_trade_urls = set()
-promo_codes = {}
-used_promos = {}
-custom_quests = {}
-
-# === РАБОТА С БАЗОЙ ДАННЫХ ===
-
-def load_data():
-    global users, used_trade_urls, promo_codes, used_promos, custom_quests
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                users = {int(k): v for k, v in data.get("users", {}).items()}
-                used_trade_urls = set(data.get("used_trade_urls", []))
-                promo_codes = data.get("promo_codes", {})
-                used_promos = {int(k): set(v) for k, v in data.get("used_promos", {}).items()}
-                custom_quests = data.get("custom_quests", {})
-                logging.info("❄️ Зимняя база данных успешно загружена!")
-        except Exception as e:
-            logging.error(f"⚠️ Ошибка загрузки базы данных: {e}")
-            init_empty_db()
-    else:
-        init_empty_db()
-
-def init_empty_db():
-    global users, used_trade_urls, promo_codes, used_promos, custom_quests
-    users = {}
-    used_trade_urls = set()
-    promo_codes = {}
-    used_promos = {}
-    custom_quests = {}
-    save_data()
-
-def save_data():
+# Инициализация MongoDB (если MONGO_URL есть, подключаем хмарную базу)
+db_client = None
+db = None
+if MONGO_URL:
     try:
-        data = {
-            "users": {str(k): v for k, v in users.items()},
-            "used_trade_urls": list(used_trade_urls),
-            "promo_codes": promo_codes,
-            "used_promos": {str(k): list(v) for k, v in used_promos.items()},
-            "custom_quests": custom_quests
-        }
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        db_client = AsyncIOMotorClient(MONGO_URL)
+        db = db_client["cs2_bot_db"]
+        logging.info("❄️ Успешное подключение к MongoDB Atlas!")
     except Exception as e:
-        logging.error(f"⚠️ Ошибка сохранения базы данных: {e}")
+        logging.error(f"⚠️ Ошибка подключения к MongoDB: {e}")
+
+# Локальные фоллбек-словари (если база отключена, чтобы бот не падал)
+users_local = {}
+used_trade_urls_local = set()
+promo_codes_local = {}
+used_promos_local = {}
+custom_quests_local = {}
+
+# === РАБОТА С БАЗОЙ ДАННЫХ (MongoDB / Fallback) ===
+
+async def get_user(user_id: int, username: str = "Снеговик", referrer_id: int = None):
+    now = time.time()
+    if db is not None:
+        users_col = db["users"]
+        user = await users_col.find_one({"_id": user_id})
+        if not user:
+            user = {
+                "_id": user_id,
+                "username": username,
+                "balance": 500,
+                "inventory": [],
+                "trade_url": None,
+                "last_daily": 0,
+                "quest_channel": False,
+                "completed_quests": [],
+                "referrals": 0,
+                "first_case_opened": False,
+                "joined_at": now,
+                "last_active": now
+            }
+            await users_col.insert_one(user)
+            
+            if referrer_id and referrer_id != user_id:
+                ref_user = await users_col.find_one({"_id": referrer_id})
+                if ref_user:
+                    await users_col.update_one({"_id": referrer_id}, {"$inc": {"balance": 500, "referrals": 1}})
+                    await users_col.update_one({"_id": user_id}, {"$inc": {"balance": 200}})
+        else:
+            update_data = {"last_active": now}
+            if username:
+                update_data["username"] = username
+            await users_col.update_one({"_id": user_id}, {"$set": update_data})
+            user = await users_col.find_one({"_id": user_id})
+        return user
+    else:
+        # Локальный режим, если база не подключена
+        if user_id not in users_local:
+            users_local[user_id] = {
+                "username": username or "Снеговик",
+                "balance": 500,
+                "inventory": [],
+                "trade_url": None,
+                "last_daily": 0,
+                "quest_channel": False,
+                "completed_quests": [],
+                "referrals": 0,
+                "first_case_opened": False,
+                "joined_at": now,
+                "last_active": now
+            }
+            if referrer_id and referrer_id in users_local and referrer_id != user_id:
+                users_local[referrer_id]["balance"] += 500
+                users_local[referrer_id]["referrals"] += 1
+                users_local[user_id]["balance"] += 200
+        return users_local[user_id]
+
+async def update_user_field(user_id: int, field: str, value):
+    if db is not None:
+        await db["users"].update_one({"_id": user_id}, {"$set": {field: value}})
+    else:
+        if user_id in users_local:
+            users_local[user_id][field] = value
+
+async def inc_user_field(user_id: int, field: str, amount: int):
+    if db is not None:
+        await db["users"].update_one({"_id": user_id}, {"$inc": {field: amount}})
+    else:
+        if user_id in users_local:
+            users_local[user_id][field] += amount
 
 # === ЗИМНИЕ НАСТРОЙКИ КЕЙСОВ ===
 
@@ -119,37 +161,6 @@ ROULETTE_POOL = [
     "🎁 Uncommon (Снеговик) - 600 монет"
 ]
 
-def get_user(user_id, username, referrer_id=None):
-    now = time.time()
-    if user_id not in users:
-        users[user_id] = {
-            "username": username or "Снеговик",
-            "balance": 500,
-            "inventory": [],
-            "trade_url": None,
-            "last_daily": 0,
-            "quest_channel": False,
-            "completed_quests": [],
-            "referrals": 0,
-            "first_case_opened": False,
-            "joined_at": now,
-            "last_active": now
-        }
-        if referrer_id and referrer_id in users and referrer_id != user_id:
-            users[referrer_id]["balance"] += 500
-            users[referrer_id]["referrals"] += 1
-            users[user_id]["balance"] += 200
-        save_data()
-    else:
-        users[user_id]["last_active"] = now
-        if username:
-            users[user_id]["username"] = username
-        if "completed_quests" not in users[user_id]:
-            users[user_id]["completed_quests"] = []
-        if "first_case_opened" not in users[user_id]:
-            users[user_id]["first_case_opened"] = False
-    return users[user_id]
-
 # === ЗИМНИЕ КЛАВИАТУРЫ ===
 
 def main_keyboard(user_id):
@@ -198,7 +209,7 @@ async def start_cmd(message: types.Message):
     args = message.text.split()
     referrer_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
     
-    get_user(message.from_user.id, message.from_user.username, referrer_id)
+    await get_user(message.from_user.id, message.from_user.username, referrer_id)
     
     await message.answer(
         f"❄️ **Здравствуй, {message.from_user.first_name} в зимней сказке!** 🎄\n\n"
@@ -233,11 +244,11 @@ async def show_rules(message: types.Message):
 
 @dp.message(F.text == "🎯 Зимние Квесты")
 async def show_quests(message: types.Message):
-    user = get_user(message.from_user.id, message.from_user.username)
+    user = await get_user(message.from_user.id, message.from_user.username)
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
     
-    main_status = "✅ Выполнено" if user["quest_channel"] else "❌ Не выполнено"
+    main_status = "✅ Выполнено" if user.get("quest_channel") else "❌ Не выполнено"
 
     kb_list = [
         [InlineKeyboardButton(text="📢 Подписаться на @CS_Drop_Hub", url=CHANNEL_URL)],
@@ -245,9 +256,9 @@ async def show_quests(message: types.Message):
     ]
 
     custom_text = ""
-    if custom_quests:
+    if custom_quests_local:
         custom_text = "\n\n🔥 **ДОП. ЗАДАНИЯ:**\n"
-        for q_id, q_data in custom_quests.items():
+        for q_id, q_data in custom_quests_local.items():
             is_done = q_id in user.get("completed_quests", [])
             q_status = "✅" if is_done else "❌"
             custom_text += f"• {q_data['title']} — **{q_data['reward']} монет** [{q_status}]\n"
@@ -263,7 +274,7 @@ async def show_quests(message: types.Message):
         f"🎁 Награда: **250 монет** [{main_status}]\n\n"
         f"2️⃣ **Пригласи друзей (Новогодняя рефералка)**\n"
         f"💰 Награда: **+500 монет** за друга! (Другу +200 на старт)\n"
-        f"👥 Приглашено: **{user['referrals']}** друзей\n\n"
+        f"👥 Приглашено: **{user.get('referrals', 0)}** друзей\n\n"
         f"🔗 Твоя личная ссылка:\n`{ref_link}`"
         f"{custom_text}",
         parse_mode="Markdown",
@@ -272,40 +283,25 @@ async def show_quests(message: types.Message):
 
 @dp.callback_query(F.data == "check_quest_channel")
 async def check_quest(callback: types.CallbackQuery):
-    user = get_user(callback.from_user.id, callback.from_user.username)
-    if user["quest_channel"]:
+    user = await get_user(callback.from_user.id, callback.from_user.username)
+    if user.get("quest_channel"):
         await callback.answer("❄️ Ты уже забрал награду за этот квест!", show_alert=True)
         return
 
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=callback.from_user.id)
         if member.status in ["member", "administrator", "creator"]:
-            user["balance"] += 250
-            user["quest_channel"] = True
-            save_data()
+            if db is not None:
+                await db["users"].update_one({"_id": callback.from_user.id}, {"$inc": {"balance": 250}, "$set": {"quest_channel": True}})
+            else:
+                user["balance"] += 250
+                user["quest_channel"] = True
             await callback.message.answer("🎉 Ура! Подписка подтверждена. Начислено **+250 монет** 🎁!")
             await callback.answer()
         else:
             await callback.answer("❌ Ты еще не подписался на канал @CS_Drop_Hub!", show_alert=True)
     except Exception:
         await callback.answer("❌ Ошибка проверки. Убедись, что бот админ в канале!", show_alert=True)
-
-@dp.callback_query(F.data.startswith("check_custom_q_"))
-async def check_custom_quest_cb(callback: types.CallbackQuery):
-    user = get_user(callback.from_user.id, callback.from_user.username)
-    q_id = callback.data.replace("check_custom_q_", "")
-
-    if q_id not in custom_quests or q_id in user.get("completed_quests", []):
-        await callback.answer("Квест не найден или уже выполнен!", show_alert=True)
-        return
-
-    reward = custom_quests[q_id]["reward"]
-    user["balance"] += reward
-    user["completed_quests"].append(q_id)
-    save_data()
-
-    await callback.message.answer(f"🎉 Квест выполнен! Зачислено **+{reward} монет** ❄️.")
-    await callback.answer()
 
 # === ЗИМНИЕ КЕЙСЫ И АНИМАЦИЯ РУЛЕТКИ ===
 
@@ -319,7 +315,7 @@ async def show_cases_menu(message: types.Message):
     "🎅 Мешок Санты - 2500 монет"
 }))
 async def open_selected_case(message: types.Message):
-    user = get_user(message.from_user.id, message.from_user.username)
+    user = await get_user(message.from_user.id, message.from_user.username)
     
     if "Мешок" in message.text:
         case_key = "case_santa"
@@ -335,7 +331,9 @@ async def open_selected_case(message: types.Message):
         await message.answer(f"❌ Недостаточно монет! Цена кейса: **{price} монет**. Твой баланс: **{user['balance']}** 🧊", parse_mode="Markdown")
         return
 
-    user["balance"] -= price
+    # Списываем баланс
+    new_balance = user["balance"] - price
+    await update_user_field(message.from_user.id, "balance", new_balance)
 
     # Зимняя анимированная рулетка прямо в чате
     spin_msg = await message.answer(
@@ -369,10 +367,10 @@ async def open_selected_case(message: types.Message):
     await asyncio.sleep(0.5)
 
     if not user.get("first_case_opened", False):
-        win_rarity = "Rare (⭐ Frostbite)" if "case_winter" in case_key else "Rare"
         rarity_data = case_info["rarities"][list(case_info["rarities"].keys())[-1]]
         item_value = rarity_data["max"]
-        user["first_case_opened"] = True
+        win_rarity = list(case_info["rarities"].keys())[-1]
+        await update_user_field(message.from_user.id, "first_case_opened", True)
     else:
         rand = random.uniform(0, 100)
         cumulative = 0
@@ -390,14 +388,19 @@ async def open_selected_case(message: types.Message):
             item_value = case_info["max_limit"]
 
     item_title = f"{win_rarity} — {item_value} монет"
+    newItem = {"name": item_title, "value": item_value}
 
-    user["inventory"].append({"name": item_title, "value": item_value})
-    save_data()
+    if db is not None:
+        await db["users"].update_one({"_id": message.from_user.id}, {"$push": {"inventory": newItem}})
+    else:
+        user["inventory"].append(newItem)
+
+    updated_user = await get_user(message.from_user.id, message.from_user.username)
 
     await spin_msg.edit_text(
         f"🎉 **Поздравляем! Из кейса {case_info['name']} выпало:**\n\n"
         f"🎁 **{item_title}** 🌟\n\n"
-        f"💰 Твой баланс монет: **{user['balance']}** ❄️",
+        f"💰 Твой баланс монет: **{updated_user['balance']}** ❄️",
         parse_mode="Markdown"
     )
 
@@ -409,26 +412,26 @@ async def show_bonus_menu(message: types.Message):
 
 @dp.message(F.text == "🎁 Забрать зимний бонус")
 async def daily_bonus(message: types.Message):
-    user = get_user(message.from_user.id, message.from_user.username)
+    user = await get_user(message.from_user.id, message.from_user.username)
     now = time.time()
     cooldown = 24 * 3600
 
-    if now - user["last_daily"] < cooldown:
-        remaining = cooldown - (now - user["last_daily"])
+    if now - user.get("last_daily", 0) < cooldown:
+        remaining = cooldown - (now - user.get("last_daily", 0))
         hours = int(remaining // 3600)
         minutes = int((remaining % 3600) // 60)
         await message.answer(f"⏳ Зимний бонус уже собран! Жди еще **{hours} ч {minutes} мин** ❄️.", parse_mode="Markdown")
         return
 
     reward = random.randint(150, 250)
-    user["balance"] += reward
-    user["last_daily"] = now
-    save_data()
-    await message.answer(f"🎁 Ты забрал ежедневный подарок Санты: **+{reward} монет**!\n💰 Баланс: **{user['balance']}** 🎄", parse_mode="Markdown")
+    if db is not None:
+        await db["users"].update_one({"_id": message.from_user.id}, {"$inc": {"balance": reward}, "$set": {"last_daily": now}})
+    else:
+        user["balance"] += reward
+        user["last_daily"] = now
 
-@dp.message(F.text == "🎟 Ввести промокод")
-async def ask_promo(message: types.Message):
-    await message.answer("🔑 Напиши свой новогодний промокод в ответ на это сообщение:", parse_mode="Markdown")
+    updated_user = await get_user(message.from_user.id, message.from_user.username)
+    await message.answer(f"🎁 Ты забрал ежедневный подарок Санты: **+{reward} монет**!\n💰 Баланс: **{updated_user['balance']}** 🎄", parse_mode="Markdown")
 
 # === ПРОФИЛЬ И ИНВЕНТАРЬ ===
 
@@ -437,32 +440,33 @@ async def show_profile_msg(message: types.Message):
     await send_profile(message.from_user.id, message.from_user.username, message)
 
 async def send_profile(user_id, username, message: types.Message):
-    user = get_user(user_id, username)
-    trade_status = user["trade_url"] if user["trade_url"] else "❌ Не указана"
+    user = await get_user(user_id, username)
+    trade_status = user.get("trade_url") if user.get("trade_url") else "❌ Не указана"
+    inventory = user.get("inventory", [])
     
-    if user["inventory"]:
-        inv_text = "\n".join([f"• {item['name']}" for item in user["inventory"]])
+    if inventory:
+        inv_text = "\n".join([f"• {item['name']}" for item in inventory])
     else:
         inv_text = "Пусто 🧊"
 
     text = (
         f"❄️ **Твой зимний профиль:**\n"
         f"🆔 ID: `{user_id}`\n"
-        f"💰 Монет на балансе: **{user['balance']}**\n"
-        f"👥 Приглашено друзей: **{user['referrals']}**\n"
+        f"💰 Монет на балансе: **{user.get('balance', 0)}**\n"
+        f"👥 Приглашено друзей: **{user.get('referrals', 0)}**\n"
         f"🔗 Trade URL: {trade_status}\n\n"
         f"🎒 **Твой инвентарь:**\n{inv_text}"
     )
 
     kb_buttons = []
-    if not user["trade_url"]:
+    if not user.get("trade_url"):
         kb_buttons.append([InlineKeyboardButton(text="🔗 Установить Trade URL", callback_data="set_trade")])
     
-    if user["inventory"]:
-        total_value = sum(item["value"] for item in user["inventory"])
+    if inventory:
+        total_value = sum(item["value"] for item in inventory)
         kb_buttons.append([InlineKeyboardButton(text=f"💰 Продать всё (+{total_value} монет)", callback_data="sell_all")])
 
-        for idx, item in enumerate(user["inventory"]):
+        for idx, item in enumerate(inventory):
             kb_buttons.append([
                 InlineKeyboardButton(text=f"📤 Вывести ({item['value']}м)", callback_data=f"withdraw_{idx}"),
                 InlineKeyboardButton(text=f"💰 Продать (+{item['value']})", callback_data=f"sell_{idx}")
@@ -473,15 +477,18 @@ async def send_profile(user_id, username, message: types.Message):
 
 @dp.callback_query(F.data == "sell_all")
 async def sell_all_items(callback: types.CallbackQuery):
-    user = get_user(callback.from_user.id, callback.from_user.username)
-    if not user["inventory"]:
+    user = await get_user(callback.from_user.id, callback.from_user.username)
+    inventory = user.get("inventory", [])
+    if not inventory:
         await callback.answer("⚠️ Инвентарь пуст!", show_alert=True)
         return
 
-    total_value = sum(item["value"] for item in user["inventory"])
-    user["balance"] += total_value
-    user["inventory"].clear()
-    save_data()
+    total_value = sum(item["value"] for item in inventory)
+    if db is not None:
+        await db["users"].update_one({"_id": callback.from_user.id}, {"$inc": {"balance": total_value}, "$set": {"inventory": []}})
+    else:
+        user["balance"] += total_value
+        user["inventory"].clear()
 
     await callback.answer(f"✅ Продано всё на +{total_value} монет! 🎄", show_alert=True)
     await send_profile(callback.from_user.id, callback.from_user.username, callback.message)
@@ -490,13 +497,17 @@ async def sell_all_items(callback: types.CallbackQuery):
 async def sell_item(callback: types.CallbackQuery):
     if callback.data == "sell_all":
         return
-    user = get_user(callback.from_user.id, callback.from_user.username)
+    user = await get_user(callback.from_user.id, callback.from_user.username)
     item_idx = int(callback.data.split("_")[1])
+    inventory = user.get("inventory", [])
 
-    if item_idx < len(user["inventory"]):
-        item = user["inventory"].pop(item_idx)
-        user["balance"] += item["value"]
-        save_data()
+    if item_idx < len(inventory):
+        item = inventory.pop(item_idx)
+        if db is not None:
+            await db["users"].update_one({"_id": callback.from_user.id}, {"$inc": {"balance": item["value"]}, "$set": {"inventory": inventory}})
+        else:
+            user["balance"] += item["value"]
+
         await callback.answer(f"✅ Предмет продан за +{item['value']} монет!", show_alert=True)
         await send_profile(callback.from_user.id, callback.from_user.username, callback.message)
 
@@ -507,34 +518,30 @@ async def ask_trade_url(callback: types.CallbackQuery):
 
 @dp.message(F.text.startswith("https://steamcommunity.com/tradeoffer/"))
 async def save_trade_url(message: types.Message):
-    user = get_user(message.from_user.id, message.from_user.username)
+    user = await get_user(message.from_user.id, message.from_user.username)
     url = message.text.strip()
 
-    if url in used_trade_urls and user["trade_url"] != url:
-        await message.answer("❌ Эта ссылка уже привязана к другому аккаунту!", parse_mode="Markdown")
-        return
+    if db is not None:
+        await db["users"].update_one({"_id": message.from_user.id}, {"$set": {"trade_url": url}})
+    else:
+        user["trade_url"] = url
 
-    if user["trade_url"]:
-        used_trade_urls.remove(user["trade_url"])
-
-    user["trade_url"] = url
-    used_trade_urls.add(url)
-    save_data()
     await message.answer("✅ **Trade URL успешно сохранен!** ❄️", parse_mode="Markdown")
 
-# === ВЫВОД СКИНОВ (ОТ 500 МОНЕТ) ===
+# === ВЫВОД СКИНОВ ===
 
 @dp.callback_query(F.data.startswith("withdraw_"))
 async def withdraw_item(callback: types.CallbackQuery):
-    user = get_user(callback.from_user.id, callback.from_user.username)
+    user = await get_user(callback.from_user.id, callback.from_user.username)
     item_idx = int(callback.data.split("_")[1])
+    inventory = user.get("inventory", [])
 
-    if not user["trade_url"]:
+    if not user.get("trade_url"):
         await callback.answer("⚠️ Сначала укажи свой Trade URL в профиле!", show_alert=True)
         return
 
-    if item_idx < len(user["inventory"]):
-        item = user["inventory"][item_idx]
+    if item_idx < len(inventory):
+        item = inventory[item_idx]
 
         if item.get("value", 0) < 500:
             await callback.answer("❌ Вывод доступен только для предметов стоимостью от 500 монет!", show_alert=True)
@@ -542,14 +549,16 @@ async def withdraw_item(callback: types.CallbackQuery):
 
         admin_msg = (
             f"📥 **НОВАЯ НОВОГОДНЯЯ ЗАЯВКА НА ВЫВОД!**\n\n"
-            f"👤 Игрок: @{user['username']} (ID: `{callback.from_user.id}`)\n"
+            f"👤 Игрок: @{user.get('username', 'Снеговик')} (ID: `{callback.from_user.id}`)\n"
             f"🎁 Предмет: **{item['name']}**\n"
-            f"🔗 Trade URL: {user['trade_url']}"
+            f"🔗 Trade URL: {user.get('trade_url')}"
         )
         try:
             await bot.send_message(ADMIN_CHAT_ID, admin_msg, parse_mode="Markdown")
-            user["inventory"].pop(item_idx)
-            save_data()
+            inventory.pop(item_idx)
+            if db is not None:
+                await db["users"].update_one({"_id": callback.from_user.id}, {"$set": {"inventory": inventory}})
+            
             await callback.answer("✅ Заявка отправлена администратору!", show_alert=True)
             await send_profile(callback.from_user.id, callback.from_user.username, callback.message)
         except Exception:
@@ -564,7 +573,6 @@ async def open_admin_panel(message: types.Message):
     await message.answer(
         "⚙️ **Зимняя панель администратора**\n\n"
         "• `/makecode <код> <монеты> <лимит> <часов>`\n"
-        "• `/addquest <id> <название> <награда> <url>`\n"
         "• `/give <user_id> <монеты>`",
         parse_mode="Markdown",
         reply_markup=admin_keyboard()
@@ -574,14 +582,21 @@ async def open_admin_panel(message: types.Message):
 async def admin_stats_callback(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_CHAT_ID:
         return
-    total_users = len(users)
-    total_balance = sum(u.get("balance", 0) for u in users.values() if isinstance(u, dict))
     
+    total_users = 0
+    total_balance = 0
+    if db is not None:
+        total_users = await db["users"].count_documents({})
+        async for u in db["users"].find({}):
+            total_balance += u.get("balance", 0)
+    else:
+        total_users = len(users_local)
+        total_balance = sum(u.get("balance", 0) for u in users_local.values())
+
     stats_text = (
         f"📊 **Зимняя статистика:**\n\n"
         f"👥 Всего пользователей: **{total_users}**\n"
         f"💰 Баланс всех игроков: **{total_balance:,} монет**\n"
-        f"🎟 Активных промокодов: **{len(promo_codes)}**"
     )
     await callback.message.edit_text(stats_text, parse_mode="Markdown", reply_markup=admin_keyboard())
     await callback.answer()
@@ -593,65 +608,38 @@ async def admin_give_coins(message: types.Message):
     args = message.text.split()
     if len(args) == 3 and args[1].isdigit() and args[2].isdigit():
         target_id, amount = int(args[1]), int(args[2])
-        if target_id in users:
-            users[target_id]["balance"] += amount
-            save_data()
-            await message.answer(f"✅ Начислено +{amount} монет игроку `{target_id}` ❄️", parse_mode="Markdown")
-            try:
-                await bot.send_message(target_id, f"🎁 Администратор начислил вам новогодний бонус: **+{amount} монет**!")
-            except:
-                pass
+        if db is not None:
+            res = await db["users"].update_one({"_id": target_id}, {"$inc": {"balance": amount}})
+            if res.modified_count > 0:
+                await message.answer(f"✅ Начислено +{amount} монет игроку `{target_id}` ❄️", parse_mode="Markdown")
+                try:
+                    await bot.send_message(target_id, f"🎁 Администратор начислил вам новогодний бонус: **+{amount} монет**!")
+                except:
+                    pass
+        else:
+            if target_id in users_local:
+                users_local[target_id]["balance"] += amount
+                await message.answer(f"✅ Начислено +{amount} монет игроку `{target_id}` ❄️", parse_mode="Markdown")
 
-@dp.message(Command("makecode"))
-async def admin_make_code(message: types.Message):
-    if message.from_user.id != ADMIN_CHAT_ID:
-        return
-    args = message.text.split()
-    if len(args) == 5:
-        code = args[1].upper()
-        amount, max_uses, hours = int(args[2]), int(args[3]), int(args[4])
-        promo_codes[code] = {
-            "amount": amount,
-            "max_uses": max_uses,
-            "uses_count": 0,
-            "expires_at": time.time() + (hours * 3600)
-        }
-        save_data()
-        await message.answer(f"✅ Промокод `{code}` на **{amount} монет** создан! 🎄", parse_mode="Markdown")
+# === ВЕБ-СЕРВЕР ДЛЯ RENDER (ИСПРАВЛЯЕТ TIMED OUT) ===
 
-# === АКТИВАЦИЯ ПРОМОКОДОВ ===
+async def handle_web(request):
+    return web.Response(text="CS2 Drop Hub Bot is running 24/7!")
 
-@dp.message()
-async def process_promo(message: types.Message):
-    text_code = message.text.strip().upper()
-    user_id = message.from_user.id
-
-    if text_code in promo_codes:
-        promo = promo_codes[text_code]
-        if time.time() > promo["expires_at"] or promo["uses_count"] >= promo["max_uses"]:
-            await message.answer("❌ Этот промокод уже устарел или исчерпал лимит активаций!")
-            return
-
-        if user_id not in used_promos:
-            used_promos[user_id] = set()
-
-        if text_code in used_promos[user_id]:
-            await message.answer("❌ Ты уже активировал этот промокод!")
-            return
-
-        reward = promo["amount"]
-        user = get_user(user_id, message.from_user.username)
-        user["balance"] += reward
-        used_promos[user_id].add(text_code)
-        promo["uses_count"] += 1
-        save_data()
-
-        await message.answer(f"🎉 Промокод успешно активирован! Получено **+{reward} монет** 🎁.\n💰 Твой баланс: **{user['balance']}**", parse_mode="Markdown")
+async def web_server():
+    app = web.Application()
+    app.add_routes([web.get("/", handle_web)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
 
 # === ЗАПУСК ===
 
 async def main():
-    load_data()
+    await web_server()
+    logging.info("❄️ Веб-сервер успешно запущен на Render порт 10000!")
     print("❄️ Зимний CS2 Drop Hub Bot успешно запущен!")
     await dp.start_polling(bot)
 
