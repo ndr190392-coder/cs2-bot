@@ -1,119 +1,125 @@
-<!DOCTYPE html>
-<html lang="uk">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CS2 Winter Drop Hub</title>
-    <!-- Підключаємо Telegram Web App JS SDK -->
-    <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <style>
-        :root {
-            --bg-color: #0f172a;
-            --card-bg: #1e293b;
-            --accent: #38bdf8;
-            --text-color: #f8fafc;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-            background-color: var(--bg-color);
-            color: var(--text-color);
-            margin: 0;
-            padding: 16px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-        h1 {
-            font-size: 22px;
-            margin-bottom: 8px;
-            text-align: center;
-        }
-        .balance-card {
-            background: var(--card-bg);
-            padding: 12px 24px;
-            border-radius: 12px;
-            font-size: 18px;
-            font-weight: bold;
-            margin-bottom: 20px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-            border: 1px solid #334155;
-        }
-        .cases-grid {
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 16px;
-            width: 100%;
-            max-width: 400px;
-        }
-        .case-card {
-            background: var(--card-bg);
-            border-radius: 16px;
-            padding: 16px;
-            text-align: center;
-            border: 1px solid #334155;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-        }
-        .case-title {
-            font-size: 16px;
-            font-weight: bold;
-            margin-bottom: 8px;
-        }
-        .case-price {
-            color: #38bdf8;
-            margin-bottom: 12px;
-            font-size: 14px;
-        }
-        .btn {
-            background-color: var(--accent);
-            color: #0f172a;
-            border: none;
-            padding: 10px 20px;
-            font-size: 14px;
-            font-weight: bold;
-            border-radius: 8px;
-            cursor: pointer;
-            width: 100%;
-            transition: 0.2s;
-        }
-        .btn:active {
-            transform: scale(0.96);
-            background-color: #0ea5e9;
-        }
-    </style>
-</head>
-<body>
+"""
+================================================================================
+❄️ CS2 DROP HUB BOT - FULL WINTER EDITION & ADVANCED CORE (v3.5.0 PROD) ❄️
+================================================================================
+"""
 
-    <h1>❄️ CS2 Winter Hub Mini App</h1>
-    <div class="balance-card">Баланс: <span id="user-balance">2000</span> 🪙</div>
+import os
+import sys
+import logging
+import random
+from datetime import datetime
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart
+from aiogram.fsm.storage.memory import MemoryStorage
+from motor.motor_asyncio import AsyncIOMotorClient
 
-    <div class="cases-grid">
-        <div class="case-card">
-            <div class="case-title">❄️ Новорічний Кеш із Ножами</div>
-            <div class="case-price">Ціна: 600 🪙</div>
-            <button class="btn" onclick="openCase('winter_knife_case', 600)">Відкрити кейс</button>
-        </div>
-        <div class="case-card">
-            <div class="case-title">🎄 Святковий Оружейний Кейс</div>
-            <div class="case-price">Ціна: 200 🪙</div>
-            <button class="btn" onclick="openCase('new_year_weapon_case', 200)">Відкрити кейс</button>
-        </div>
-    </div>
+# Логування
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(name)s - %(message)s",
+    stream=sys.stdout
+)
+logger = logging.getLogger("CS2_WINTER_HUB_BOT")
 
-    <script>
-        // Ініціалізація Telegram Web App
-        let tg = window.Telegram.WebApp;
-        tg.expand(); // Розгортаємо на весь екран
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8825098686:AAH2mVz2pOo_vl6T6yMpRA_f-zWLMPMfVdc")
+MONGO_URL = os.getenv("MONGO_URL", "mongodb+srv://ndr190392_db_user:D5eeW7ZwpeBjbryY@cluster0.evqeech.mongodb.net/?retryWrites=true&w=majority")
+PORT = int(os.getenv("PORT", 10000))
 
-        function openCase(caseId, price) {
-            let currentBalance = parseInt(document.getElementById('user-balance').innerText);
-            if (currentBalance < price) {
-                tg.showAlert("❌ Недостатньо монет на балансі!");
-                return;
-            }
-            currentBalance -= price;
-            document.getElementById('user-balance').innerText = currentBalance;
-            tg.showAlert(`🎉 Ви успішно відкрили кейс та вибили крутий скін!`);
+# Підключення до БД
+db_client: AsyncIOMotorClient = None
+db = None
+users_collection = None
+
+async def initialize_database_cluster() -> None:
+    global db_client, db, users_collection
+    try:
+        db_client = AsyncIOMotorClient(MONGO_URL)
+        db = db_client.get_database("cs2_winter_ultimate_db")
+        users_collection = db.get_collection("users")
+        await db_client.admin.command('ping')
+        logger.info("❄️ [DB] Успішне підключення до MongoDB Atlas!")
+    except Exception as err:
+        logger.error(f"❌ [DB] Помилка підключення: {err}")
+        sys.exit(1)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+
+WINTER_CASES_CATALOG = {
+    "winter_knife_case": {
+        "name": "❄️ Новорічний Кеш із Ножами",
+        "price": 600,
+        "items": [
+            {"name": "Karambit | Arctic Fade (FN)", "price": 18000, "rarity": "⭐️ Covert", "drop_rate": 1},
+            {"name": "M9 Bayonet | Blizzard Steel (MW)", "price": 14000, "rarity": "⭐️ Covert", "drop_rate": 2},
+            {"name": "AWP | Winter Asiimov (FT)", "price": 2200, "rarity": "🔴 Classified", "drop_rate": 15},
+            {"name": "AK-47 | Blue Snow (MW)", "price": 500, "rarity": "🟣 Restricted", "drop_rate": 30},
+            {"name": "P250 | Frozen Dune (BS)", "price": 15, "rarity": "⚪️ Consumer", "drop_rate": 52}
+        ]
+    }
+}
+
+async def fetch_user_profile(user_id: int, username: str = "Стрілець") -> dict:
+    user = await users_collection.find_one({"user_id": user_id})
+    if not user:
+        user = {
+            "user_id": user_id,
+            "username": username,
+            "balance": 2000,
+            "inventory": [],
+            "cases_opened": 0
         }
-    </script>
-</body>
-</html>
+        await users_collection.insert_one(user)
+    return user
+
+@router.message(CommandStart())
+async def command_start_handler(message: Message) -> None:
+    await fetch_user_profile(message.from_user.id, message.from_user.first_name)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Відкрити кейси", callback_data="cases_menu")],
+        [InlineKeyboardButton(text="👤 Профіль", callback_data="profile")]
+    ])
+    await message.answer("❄️ **Вітаю у CS2 Winter Hub!**", reply_markup=kb, parse_mode="Markdown")
+
+@router.callback_query(F.data == "profile")
+async def callback_user_profile(callback: CallbackQuery) -> None:
+    user = await fetch_user_profile(callback.from_user.id)
+    await callback.message.edit_text(
+        f"👤 **Профіль:**\n💰 Баланс: **{user['balance']} 🪙**\n📦 Відкрито кейсів: **{user['cases_opened']}**",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Меню", callback_data="main_menu")]]),
+        parse_mode="Markdown"
+    )
+
+@router.callback_query(F.data == "main_menu")
+async def callback_main_menu(callback: CallbackQuery) -> None:
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 Відкрити кейси", callback_data="cases_menu")],
+        [InlineKeyboardButton(text="👤 Профіль", callback_data="profile")]
+    ])
+    await callback.message.edit_text("🏠 **Головне меню:**", reply_markup=kb, parse_mode="Markdown")
+
+async def handle_web_ping(request: web.Request) -> web.Response:
+    return web.Response(text="Bot is running 24/7!", content_type="text/plain")
+
+async def start_background_web_server() -> None:
+    app = web.Application()
+    app.router.add_get("/", handle_web_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+async def main() -> None:
+    await initialize_database_cluster()
+    dp.include_router(router)
+    await start_background_web_server()
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
